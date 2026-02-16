@@ -266,6 +266,20 @@ class TimeSeries:
             grouped.setdefault(key, {})[name] = tfm
         return grouped
 
+    def _get_partition_tfms(
+        self,
+    ) -> Dict[Tuple[str, ...], Dict[str, _BaseLagTransform]]:
+        partitioned: Dict[Tuple[str, ...], Dict[str, _BaseLagTransform]] = {}
+        for name, tfm in self.transforms.items():
+            if not isinstance(tfm, _BaseLagTransform):
+                continue
+            partition_by = getattr(tfm, "partition_by", None)
+            if not partition_by:
+                continue
+            key = tuple(partition_by)
+            partitioned.setdefault(key, {})[name] = tfm
+        return partitioned
+
     def _get_local_tfms(
         self,
         transforms: Mapping[str, Union[Tuple[Any, ...], _BaseLagTransform]],
@@ -276,12 +290,18 @@ class TimeSeries:
                 continue
             if isinstance(tfm, _BaseLagTransform) and getattr(tfm, "groupby", None):
                 continue
+            if isinstance(tfm, _BaseLagTransform) and getattr(tfm, "partition_by", None):
+                continue
             local[name] = tfm
         return local
 
     def _check_aligned_ends(self) -> None:
         """Check that all series end at the same timestamp when using global/group transforms."""
-        if not (self._get_global_tfms() or self._get_group_tfms()):
+        if not (
+            self._get_global_tfms()
+            or self._get_group_tfms()
+            or self._get_partition_tfms()
+        ):
             return
         if isinstance(self.last_dates, pd.Index):
             aligned = self.last_dates.nunique() == 1
@@ -435,15 +455,17 @@ class TimeSeries:
             f for f in self.features if f not in df.columns
         ]
         self._group_states: Dict[Tuple[str, ...], Dict[str, Any]] = {}
+        self._partition_states: Dict[Tuple[str, ...], Dict[str, Any]] = {}
         group_tfms = self._get_group_tfms()
-        if group_tfms:
+        partition_tfms = self._get_partition_tfms()
+        if group_tfms or partition_tfms:
             if self.target_transforms is not None:
                 transformed_target = ga.data
                 if self._restore_idxs is not None:
                     transformed_target = transformed_target[self._restore_idxs]
-                df_for_group = ufp.assign_columns(df, target_col, transformed_target)
+                df_for_agg = ufp.assign_columns(df, target_col, transformed_target)
             else:
-                df_for_group = df
+                df_for_agg = df
 
             def _add_group_id(data, cols):
                 if isinstance(data, pd.DataFrame):
@@ -468,14 +490,16 @@ class TimeSeries:
                     if col not in df.columns:
                         raise ValueError(f"Groupby column '{col}' not found in dataframe.")
                 group_cols_list = list(group_cols)
-                missing = [c for c in group_cols_list if c not in self.static_features_.columns]
+                missing = [
+                    c for c in group_cols_list if c not in self.static_features_.columns
+                ]
                 if missing:
                     raise ValueError(
                         "Groupby columns must be static features. "
                         f"Missing from static_features: {missing}."
                     )
                 group_df = ufp.group_by_agg(
-                    df_for_group[group_cols_list + [time_col, target_col]],
+                    df_for_agg[group_cols_list + [time_col, target_col]],
                     group_cols_list + [time_col],
                     {target_col: "sum"},
                     maintain_order=True,
@@ -498,19 +522,72 @@ class TimeSeries:
                     group_df = ufp.take_rows(group_df, processed.sort_idxs)
                 group_df = ufp.drop_index_if_pandas(group_df)
                 group_values = processed.data[:, 0]
-                ga = GroupedArray(group_values, processed.indptr)
+                agg_ga = GroupedArray(group_values, processed.indptr)
                 group_uids = processed.uids
                 series_group_id = _map_group_id(
                     self.static_features_, groups, group_cols_list
                 )
                 group_idx = series_group_id.astype(np.int64, copy=False)
                 self._group_states[group_cols] = {
-                    "ga": ga,
+                    "ga": agg_ga,
                     "df": group_df,
                     "group_cols": group_cols_list,
                     "groups": groups,
                     "group_uids": group_uids,
                     "group_idx": group_idx,
+                }
+
+            for partition_cols, _tfms in partition_tfms.items():
+                for col in partition_cols:
+                    if col not in df.columns:
+                        raise ValueError(
+                            f"Partition column '{col}' not found in dataframe."
+                        )
+                partition_cols_list = list(partition_cols)
+                partition_df = ufp.group_by_agg(
+                    df_for_agg[partition_cols_list + [time_col, target_col]],
+                    partition_cols_list + [time_col],
+                    {target_col: "sum"},
+                    maintain_order=True,
+                )
+                partition_df = ufp.sort(
+                    partition_df, by=partition_cols_list + [time_col]
+                )
+                partition_df, partitions = _add_group_id(
+                    partition_df, partition_cols_list
+                )
+                partition_df = ufp.drop_index_if_pandas(partition_df)
+                partitions = ufp.drop_index_if_pandas(partitions)
+                if isinstance(partition_df, pd.DataFrame):
+                    process_df = partition_df[["_group_id", time_col, target_col]]
+                else:
+                    process_df = partition_df.select(
+                        ["_group_id", time_col, target_col]
+                    )
+                processed = ufp.process_df(
+                    process_df,
+                    id_col="_group_id",
+                    time_col=time_col,
+                    target_col=target_col,
+                )
+                if processed.sort_idxs is not None:
+                    partition_df = ufp.take_rows(partition_df, processed.sort_idxs)
+                partition_df = ufp.drop_index_if_pandas(partition_df)
+                partition_values = processed.data[:, 0]
+                agg_ga = GroupedArray(partition_values, processed.indptr)
+                static_cols = [
+                    c for c in partition_cols_list if c in self.static_features_.columns
+                ]
+                dynamic_cols = [c for c in partition_cols_list if c not in static_cols]
+                self._partition_states[partition_cols] = {
+                    "ga": agg_ga,
+                    "df": partition_df,
+                    "partition_cols": partition_cols_list,
+                    "partitions": partitions,
+                    "partition_uids": processed.uids,
+                    "static_cols": static_cols,
+                    "dynamic_cols": dynamic_cols,
+                    "partition_idx": None,
                 }
         return self
 
@@ -632,6 +709,37 @@ class TimeSeries:
                         join_df = join_df.with_columns(pl.Series(name=name, values=vals))
                     joined = df.select(group_cols_list + [self.time_col]).join(
                         join_df, on=group_cols_list + [self.time_col], how="left"
+                    )
+                    for name in feature_cols:
+                        features[name] = joined[name].to_numpy()
+        partition_tfms = self._get_partition_tfms()
+        if partition_tfms:
+            for partition_cols, tfms in partition_tfms.items():
+                state = self._partition_states[partition_cols]
+                partition_df = state["df"]
+                ga = state["ga"]
+                partition_vals = ga.apply_transforms(transforms=tfms, updates_only=False)
+                partition_cols_list = state["partition_cols"]
+                feature_cols = list(partition_vals.keys())
+                if isinstance(df, pd.DataFrame):
+                    join_df = partition_df[partition_cols_list + [self.time_col]].copy()
+                    for name, vals in partition_vals.items():
+                        join_df[name] = vals
+                    joined = df[partition_cols_list + [self.time_col]].merge(
+                        join_df,
+                        on=partition_cols_list + [self.time_col],
+                        how="left",
+                    )
+                    for name in feature_cols:
+                        features[name] = joined[name].to_numpy()
+                else:
+                    join_df = partition_df.select(partition_cols_list + [self.time_col])
+                    for name, vals in partition_vals.items():
+                        join_df = join_df.with_columns(pl.Series(name=name, values=vals))
+                    joined = df.select(partition_cols_list + [self.time_col]).join(
+                        join_df,
+                        on=partition_cols_list + [self.time_col],
+                        how="left",
                     )
                     for name in feature_cols:
                         features[name] = joined[name].to_numpy()
@@ -942,8 +1050,22 @@ class TimeSeries:
                 group_sums = np.zeros(n_groups, dtype=self.ga.data.dtype)
                 np.add.at(group_sums, group_idx, new_arr)
                 state["ga"] = state["ga"].append(group_sums)
+        partition_tfms = self._get_partition_tfms()
+        if partition_tfms:
+            for partition_cols in partition_tfms.keys():
+                state = self._partition_states[partition_cols]
+                partition_idx = state.get("partition_idx")
+                if partition_idx is None:
+                    raise RuntimeError(
+                        "Missing partition assignments for partition lag transforms."
+                    )
+                n_groups = state["ga"].n_groups
+                partition_sums = np.zeros(n_groups, dtype=self.ga.data.dtype)
+                np.add.at(partition_sums, partition_idx, new_arr)
+                state["ga"] = state["ga"].append(partition_sums)
+                state["partition_idx"] = None
 
-    def _update_features(self) -> DataFrame:
+    def _update_features(self, new_x: Optional[DataFrame] = None) -> DataFrame:
         """Compute the current values of all the features using the latest values of the time series."""
         self.curr_dates: Union[pd.Index, pl_Series] = ufp.offset_times(
             self.curr_dates, self.freq, 1
@@ -968,6 +1090,77 @@ class TimeSeries:
                 group_idx = state["group_idx"]
                 for name, vals in updates.items():
                     features[name] = vals[group_idx]
+        partition_tfms = self._get_partition_tfms()
+        if partition_tfms:
+            for partition_cols, tfms in partition_tfms.items():
+                state = self._partition_states[partition_cols]
+                updates = state["ga"].apply_transforms(transforms=tfms, updates_only=True)
+                partition_cols_list = state["partition_cols"]
+                dynamic_cols = state["dynamic_cols"]
+                if dynamic_cols:
+                    if new_x is None:
+                        raise ValueError(
+                            "Partition lag transforms with dynamic partition columns require exogenous inputs in `X_df`."
+                        )
+                    missing = [c for c in dynamic_cols if c not in new_x]
+                    if missing:
+                        raise ValueError(
+                            "X_df is missing required partition columns for partition lag transforms: "
+                            f"{missing}."
+                        )
+                if isinstance(self.static_features_, pd.DataFrame):
+                    partition_keys = pd.DataFrame(index=np.arange(len(self.uids)))
+                else:
+                    partition_keys = pl_DataFrame()
+                for col in partition_cols_list:
+                    if col in state["static_cols"]:
+                        values = self.static_features_[col].to_numpy()
+                    else:
+                        assert new_x is not None
+                        values = new_x[col].to_numpy()
+                    if isinstance(partition_keys, pd.DataFrame):
+                        partition_keys[col] = values
+                    else:
+                        partition_keys = partition_keys.with_columns(
+                            pl.Series(name=col, values=values)
+                        )
+                partitions = state["partitions"]
+                if isinstance(partition_keys, pd.DataFrame):
+                    mapped = partition_keys.merge(
+                        partitions, on=partition_cols_list, how="left"
+                    )
+                    missing_mask = mapped["_group_id"].isna()
+                    if missing_mask.any():
+                        unseen = (
+                            mapped.loc[missing_mask, partition_cols_list]
+                            .drop_duplicates()
+                            .to_dict("records")
+                        )
+                        raise ValueError(
+                            "Found unseen partition values during prediction for partition lag transforms: "
+                            f"{unseen}."
+                        )
+                    partition_idx = mapped["_group_id"].to_numpy(dtype=np.int64)
+                else:
+                    mapped = partition_keys.join(
+                        partitions, on=partition_cols_list, how="left"
+                    )
+                    missing_mask = mapped["_group_id"].is_null()
+                    if missing_mask.any():
+                        unseen = (
+                            mapped.filter(missing_mask)
+                            .select(partition_cols_list)
+                            .unique(maintain_order=True)
+                            .to_dicts()
+                        )
+                        raise ValueError(
+                            "Found unseen partition values during prediction for partition lag transforms: "
+                            f"{unseen}."
+                        )
+                    partition_idx = mapped["_group_id"].to_numpy().astype(np.int64)
+                state["partition_idx"] = partition_idx
+                for name, vals in updates.items():
+                    features[name] = vals[partition_idx]
 
         for feature in self.date_features:
             feat_name, feat_vals = self._compute_date_feature(self.curr_dates, feature)
@@ -1010,7 +1203,7 @@ class TimeSeries:
         return df
 
     def _get_features_for_next_step(self, X_df=None):
-        new_x = self._update_features()
+        X = None
         if X_df is not None:
             n_series = len(self.uids)
             h = X_df.shape[0] // n_series  # how many timestamps per series
@@ -1019,6 +1212,8 @@ class TimeSeries:
             rows = np.arange(row_offset, X_df.shape[0], h)
             X = ufp.take_rows(X_df, rows)
             X = ufp.drop_index_if_pandas(X)
+        new_x = self._update_features(X)
+        if X_df is not None:
             new_x = ufp.horizontal_concat([new_x, X])
         if isinstance(new_x, pd.DataFrame):
             nulls = new_x.isnull().any()
@@ -1041,6 +1236,7 @@ class TimeSeries:
         # if these save state (like ExpandingMean) they'll get modified by the updates
         lag_tfms = copy.deepcopy(self.transforms)
         group_states = copy.deepcopy(getattr(self, "_group_states", {}))
+        partition_states = copy.deepcopy(getattr(self, "_partition_states", {}))
         global_ga = copy.copy(getattr(self, "_global_ga", None))
         global_times = copy.copy(getattr(self, "_global_times", None))
         try:
@@ -1053,6 +1249,8 @@ class TimeSeries:
                 self._global_times = global_times
             if group_states:
                 self._group_states = group_states
+            if partition_states:
+                self._partition_states = partition_states
 
     def _predict_setup(self) -> None:
         # TODO: move to utils
@@ -1237,9 +1435,13 @@ class TimeSeries:
         X_df: Optional[DFType] = None,
         ids: Optional[List[str]] = None,
     ) -> DFType:
-        if ids is not None and (self._get_global_tfms() or self._get_group_tfms()):
+        if ids is not None and (
+            self._get_global_tfms()
+            or self._get_group_tfms()
+            or self._get_partition_tfms()
+        ):
             raise ValueError(
-                "Cannot use `ids` with global or group lag transforms. "
+                "Cannot use `ids` with global, group or partition lag transforms. "
                 "These transforms require forecasting all series together."
             )
         self._check_aligned_ends()
@@ -1452,7 +1654,7 @@ class TimeSeries:
         values = df[self.target_col].to_numpy()
         values = values.astype(self.ga.data.dtype, copy=False)
         self._check_aligned_ends()
-        if self._get_global_tfms() or self._get_group_tfms():
+        if self._get_global_tfms() or self._get_group_tfms() or self._get_partition_tfms():
             if isinstance(df, pd.DataFrame):
                 expected_ids = pd.Index(uids).union(pd.Index(new_ids))
                 expected_count = len(expected_ids)
@@ -1644,3 +1846,90 @@ class TimeSeries:
                         .to_numpy()
                     )
                     state["group_idx"] = series_group_id.astype(np.int64, copy=False)
+        partition_tfms = self._get_partition_tfms()
+        if partition_tfms:
+            def _attach_partition_id(data, partitions, cols):
+                if isinstance(data, pd.DataFrame):
+                    return data.merge(partitions, on=cols, how="left")
+                return data.join(partitions, on=cols, how="left")
+
+            for partition_cols in partition_tfms.keys():
+                state = self._partition_states[partition_cols]
+                partition_cols_list = state["partition_cols"]
+                partition_df = ufp.group_by_agg(
+                    df[partition_cols_list + [self.time_col, self.target_col]],
+                    partition_cols_list + [self.time_col],
+                    {self.target_col: "sum"},
+                    maintain_order=True,
+                )
+                partition_df = ufp.sort(
+                    partition_df, by=partition_cols_list + [self.time_col]
+                )
+                partitions = state["partitions"]
+                partition_df = _attach_partition_id(
+                    partition_df, partitions, partition_cols_list
+                )
+                if isinstance(partition_df, pd.DataFrame):
+                    missing = partition_df["_group_id"].isna()
+                    if missing.any():
+                        new_partitions = (
+                            partition_df.loc[missing, partition_cols_list]
+                            .drop_duplicates()
+                            .reset_index(drop=True)
+                        )
+                        start = len(partitions)
+                        new_partitions["_group_id"] = np.arange(
+                            start, start + len(new_partitions), dtype=np.int64
+                        )
+                        partitions = pd.concat(
+                            [partitions, new_partitions], ignore_index=True
+                        )
+                        partition_df = partition_df.drop(columns="_group_id").merge(
+                            partitions, on=partition_cols_list, how="left"
+                        )
+                else:
+                    missing = partition_df["_group_id"].is_null()
+                    if missing.any():
+                        new_partitions = (
+                            partition_df.filter(missing)
+                            .select(partition_cols_list)
+                            .unique(maintain_order=True)
+                        )
+                        start = partitions.height
+                        new_partitions = new_partitions.with_row_index(
+                            name="_group_id", offset=start
+                        )
+                        partitions = pl.concat(
+                            [partitions, new_partitions], how="vertical"
+                        )
+                        partition_df = partition_df.drop("_group_id").join(
+                            partitions, on=partition_cols_list, how="left"
+                        )
+                state["partitions"] = partitions
+                id_counts = ufp.counts_by_id(partition_df, "_group_id")
+                uids = state["partition_uids"]
+                if isinstance(uids, pd.Index):
+                    uids = pd.Series(uids)
+                uids, new_ids = ufp.match_if_categorical(
+                    uids, partition_df["_group_id"]
+                )
+                partition_df = ufp.assign_columns(partition_df, "_group_id", new_ids)
+                partition_df = ufp.sort(partition_df, by=["_group_id", self.time_col])
+                values = partition_df[self.target_col].to_numpy().astype(
+                    self.ga.data.dtype, copy=False
+                )
+                try:
+                    sizes = ufp.join(
+                        uids, id_counts, on="_group_id", how="outer_coalesce"
+                    )
+                except (KeyError, ValueError):
+                    sizes = ufp.join(uids, id_counts, on="_group_id", how="outer")
+                sizes = ufp.fill_null(sizes, {"counts": 0})
+                sizes = ufp.sort(sizes, by="_group_id")
+                new_groups = ~ufp.is_in(sizes["_group_id"], uids)
+                state["ga"] = state["ga"].append_several(
+                    new_sizes=sizes["counts"].to_numpy().astype(np.int32),
+                    new_values=values,
+                    new_groups=new_groups.to_numpy(),
+                )
+                state["partition_uids"] = ufp.sort(sizes["_group_id"])

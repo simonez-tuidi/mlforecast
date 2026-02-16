@@ -34,16 +34,25 @@ from sklearn.base import BaseEstimator
 def _pascal2camel(pascal_str: str) -> str:
     return re.sub(r"(?<!^)(?=[A-Z])", "_", pascal_str).lower()
 
-def _normalize_groupby(groupby):
-    if groupby is None:
+def _normalize_cols(cols):
+    if cols is None:
         return None
-    if isinstance(groupby, str):
-        groupby = [groupby]
+    if isinstance(cols, str):
+        cols = [cols]
     else:
-        groupby = list(groupby)
-    if not groupby:
+        cols = list(cols)
+    if not cols:
         return None
-    return groupby
+    return cols
+
+
+def _validate_mode_args(global_: bool, groupby, partition_by) -> None:
+    if global_ and groupby:
+        raise ValueError("`global_` and `groupby` can't be used together.")
+    if global_ and partition_by:
+        raise ValueError("`global_` and `partition_by` can't be used together.")
+    if groupby and partition_by:
+        raise ValueError("`groupby` and `partition_by` can't be used together.")
 
 
 class _BaseLagTransform(BaseEstimator):
@@ -59,6 +68,7 @@ class _BaseLagTransform(BaseEstimator):
         init_args.pop("global_", None)
         init_args.pop("global", None)
         init_args.pop("groupby", None)
+        init_args.pop("partition_by", None)
         self._core_tfm = getattr(core_tfms, self.__class__.__name__)(
             lag=lag, **init_args
         )
@@ -68,17 +78,21 @@ class _BaseLagTransform(BaseEstimator):
         init_params = self._get_init_signature()
         prefix = ""
         groupby = getattr(self, "groupby", None)
+        partition_by = getattr(self, "partition_by", None)
         if getattr(self, "global_", False):
             prefix = "global_"
         elif groupby:
             group_str = "__".join(groupby)
             prefix = f"groupby_{group_str}_"
+        elif partition_by:
+            partition_str = "__".join(partition_by)
+            prefix = f"partitionby_{partition_str}_"
         result = f"{prefix}{_pascal2camel(self.__class__.__name__)}_lag{lag}"
         changed_params = [
             f"{name}{getattr(self, name)}"
             for name, arg in init_params.items()
             if arg.default != getattr(self, name)
-            and name not in {"global_", "groupby"}
+            and name not in {"global_", "groupby", "partition_by"}
         ]
         if changed_params:
             result += "_" + "_".join(changed_params)
@@ -140,6 +154,7 @@ class _RollingBase(_BaseLagTransform):
         min_samples: Optional[int] = None,
         global_: bool = False,
         groupby: Optional[Sequence[str]] = None,
+        partition_by: Optional[Sequence[str]] = None,
         **kwargs,
     ):
         """
@@ -151,19 +166,28 @@ class _RollingBase(_BaseLagTransform):
                 Requires all series to end at the same timestamp. Defaults to False.
             groupby (Sequence[str], optional): Column names to group by before computing the statistic.
                 Columns must be static features. Mutually exclusive with `global_`. Defaults to None.
+            partition_by (Sequence[str], optional): Column names to partition by before
+                computing the statistic (SQL-style window partition). Mutually exclusive
+                with `global_` and `groupby`. Defaults to None.
         """
         if "global" in kwargs:
             global_ = kwargs.pop("global")
         if "groupby" in kwargs:
             groupby = kwargs.pop("groupby")
+        if "partition_by" in kwargs:
+            partition_by = kwargs.pop("partition_by")
         if kwargs:
             raise TypeError(f"Unexpected keyword arguments: {list(kwargs)}")
         self.window_size = window_size
         self.min_samples = min_samples
         self.global_ = global_
-        self.groupby = _normalize_groupby(groupby)
-        if self.global_ and self.groupby:
-            raise ValueError("`global_` and `groupby` can't be used together.")
+        self.groupby = _normalize_cols(groupby)
+        self.partition_by = _normalize_cols(partition_by)
+        _validate_mode_args(
+            global_=self.global_,
+            groupby=self.groupby,
+            partition_by=self.partition_by,
+        )
 
     @property
     def update_samples(self) -> int:
@@ -190,6 +214,7 @@ class RollingQuantile(_RollingBase):
         min_samples: Optional[int] = None,
         global_: bool = False,
         groupby: Optional[Sequence[str]] = None,
+        partition_by: Optional[Sequence[str]] = None,
         **kwargs,
     ):
         super().__init__(
@@ -197,6 +222,7 @@ class RollingQuantile(_RollingBase):
             min_samples=min_samples,
             global_=global_,
             groupby=groupby,
+            partition_by=partition_by,
             **kwargs,
         )
         self.p = p
@@ -221,6 +247,7 @@ class _Seasonal_RollingBase(_BaseLagTransform):
         min_samples: Optional[int] = None,
         global_: bool = False,
         groupby: Optional[Sequence[str]] = None,
+        partition_by: Optional[Sequence[str]] = None,
         **kwargs,
     ):
         """
@@ -233,20 +260,29 @@ class _Seasonal_RollingBase(_BaseLagTransform):
                 Requires all series to end at the same timestamp. Defaults to False.
             groupby (Sequence[str], optional): Column names to group by before computing the statistic.
                 Columns must be static features. Mutually exclusive with `global_`. Defaults to None.
+            partition_by (Sequence[str], optional): Column names to partition by before
+                computing the statistic (SQL-style window partition). Mutually exclusive
+                with `global_` and `groupby`. Defaults to None.
         """
         if "global" in kwargs:
             global_ = kwargs.pop("global")
         if "groupby" in kwargs:
             groupby = kwargs.pop("groupby")
+        if "partition_by" in kwargs:
+            partition_by = kwargs.pop("partition_by")
         if kwargs:
             raise TypeError(f"Unexpected keyword arguments: {list(kwargs)}")
         self.season_length = season_length
         self.window_size = window_size
         self.min_samples = min_samples
         self.global_ = global_
-        self.groupby = _normalize_groupby(groupby)
-        if self.global_ and self.groupby:
-            raise ValueError("`global_` and `groupby` can't be used together.")
+        self.groupby = _normalize_cols(groupby)
+        self.partition_by = _normalize_cols(partition_by)
+        _validate_mode_args(
+            global_=self.global_,
+            groupby=self.groupby,
+            partition_by=self.partition_by,
+        )
 
     @property
     def update_samples(self) -> int:
@@ -274,6 +310,7 @@ class SeasonalRollingQuantile(_Seasonal_RollingBase):
         min_samples: Optional[int] = None,
         global_: bool = False,
         groupby: Optional[Sequence[str]] = None,
+        partition_by: Optional[Sequence[str]] = None,
         **kwargs,
     ):
         super().__init__(
@@ -282,6 +319,7 @@ class SeasonalRollingQuantile(_Seasonal_RollingBase):
             min_samples=min_samples,
             global_=global_,
             groupby=groupby,
+            partition_by=partition_by,
             **kwargs,
         )
         self.p = p
@@ -295,24 +333,34 @@ class _ExpandingBase(_BaseLagTransform):
             Requires all series to end at the same timestamp. Defaults to False.
         groupby (Sequence[str], optional): Column names to group by before computing the statistic.
             Columns must be static features. Mutually exclusive with `global_`. Defaults to None.
+        partition_by (Sequence[str], optional): Column names to partition by before
+            computing the statistic (SQL-style window partition). Mutually exclusive
+            with `global_` and `groupby`. Defaults to None.
     """
 
     def __init__(
         self,
         global_: bool = False,
         groupby: Optional[Sequence[str]] = None,
+        partition_by: Optional[Sequence[str]] = None,
         **kwargs,
     ):
         if "global" in kwargs:
             global_ = kwargs.pop("global")
         if "groupby" in kwargs:
             groupby = kwargs.pop("groupby")
+        if "partition_by" in kwargs:
+            partition_by = kwargs.pop("partition_by")
         if kwargs:
             raise TypeError(f"Unexpected keyword arguments: {list(kwargs)}")
         self.global_ = global_
-        self.groupby = _normalize_groupby(groupby)
-        if self.global_ and self.groupby:
-            raise ValueError("`global_` and `groupby` can't be used together.")
+        self.groupby = _normalize_cols(groupby)
+        self.partition_by = _normalize_cols(partition_by)
+        _validate_mode_args(
+            global_=self.global_,
+            groupby=self.groupby,
+            partition_by=self.partition_by,
+        )
 
     @property
     def update_samples(self) -> int:
@@ -337,9 +385,15 @@ class ExpandingQuantile(_ExpandingBase):
         p: float,
         global_: bool = False,
         groupby: Optional[Sequence[str]] = None,
+        partition_by: Optional[Sequence[str]] = None,
         **kwargs,
     ):
-        super().__init__(global_=global_, groupby=groupby, **kwargs)
+        super().__init__(
+            global_=global_,
+            groupby=groupby,
+            partition_by=partition_by,
+            **kwargs,
+        )
         self.p = p
 
     @property
@@ -356,6 +410,9 @@ class ExponentiallyWeightedMean(_BaseLagTransform):
             Requires all series to end at the same timestamp. Defaults to False.
         groupby (Sequence[str], optional): Column names to group by before computing the statistic.
             Columns must be static features. Mutually exclusive with `global_`. Defaults to None.
+        partition_by (Sequence[str], optional): Column names to partition by before
+            computing the statistic (SQL-style window partition). Mutually exclusive
+            with `global_` and `groupby`. Defaults to None.
     """
 
     def __init__(
@@ -363,19 +420,26 @@ class ExponentiallyWeightedMean(_BaseLagTransform):
         alpha: float,
         global_: bool = False,
         groupby: Optional[Sequence[str]] = None,
+        partition_by: Optional[Sequence[str]] = None,
         **kwargs,
     ):
         if "global" in kwargs:
             global_ = kwargs.pop("global")
         if "groupby" in kwargs:
             groupby = kwargs.pop("groupby")
+        if "partition_by" in kwargs:
+            partition_by = kwargs.pop("partition_by")
         if kwargs:
             raise TypeError(f"Unexpected keyword arguments: {list(kwargs)}")
         self.alpha = alpha
         self.global_ = global_
-        self.groupby = _normalize_groupby(groupby)
-        if self.global_ and self.groupby:
-            raise ValueError("`global_` and `groupby` can't be used together.")
+        self.groupby = _normalize_cols(groupby)
+        self.partition_by = _normalize_cols(partition_by)
+        _validate_mode_args(
+            global_=self.global_,
+            groupby=self.groupby,
+            partition_by=self.partition_by,
+        )
 
     @property
     def update_samples(self) -> int:
@@ -395,6 +459,7 @@ class Offset(_BaseLagTransform):
         self.n = n
         self.global_ = getattr(tfm, "global_", False)
         self.groupby = getattr(tfm, "groupby", None)
+        self.partition_by = getattr(tfm, "partition_by", None)
 
     def _get_name(self, lag: int) -> str:
         return self.tfm._get_name(lag + self.n)
@@ -428,12 +493,17 @@ class Combine(_BaseLagTransform):
         global_2 = getattr(tfm2, "global_", False)
         groupby_1 = getattr(tfm1, "groupby", None)
         groupby_2 = getattr(tfm2, "groupby", None)
+        partition_by_1 = getattr(tfm1, "partition_by", None)
+        partition_by_2 = getattr(tfm2, "partition_by", None)
         if global_1 != global_2:
             raise ValueError("Can't combine transforms with different global_ settings.")
         if (groupby_1 or groupby_2) and groupby_1 != groupby_2:
             raise ValueError("Can't combine transforms with different groupby settings.")
+        if (partition_by_1 or partition_by_2) and partition_by_1 != partition_by_2:
+            raise ValueError("Can't combine transforms with different partition_by settings.")
         self.global_ = global_1
         self.groupby = groupby_1
+        self.partition_by = partition_by_1
 
     def _set_core_tfm(self, lag: int) -> "Combine":
         self.tfm1 = copy.deepcopy(self.tfm1)._set_core_tfm(lag)
