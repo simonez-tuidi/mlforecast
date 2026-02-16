@@ -297,11 +297,7 @@ class TimeSeries:
 
     def _check_aligned_ends(self) -> None:
         """Check that all series end at the same timestamp when using global/group transforms."""
-        if not (
-            self._get_global_tfms()
-            or self._get_group_tfms()
-            or self._get_partition_tfms()
-        ):
+        if not (self._get_global_tfms() or self._get_group_tfms()):
             return
         if isinstance(self.last_dates, pd.Index):
             aligned = self.last_dates.nunique() == 1
@@ -544,17 +540,18 @@ class TimeSeries:
                             f"Partition column '{col}' not found in dataframe."
                         )
                 partition_cols_list = list(partition_cols)
+                partition_key_cols = [id_col, *partition_cols_list]
                 partition_df = ufp.group_by_agg(
-                    df_for_agg[partition_cols_list + [time_col, target_col]],
-                    partition_cols_list + [time_col],
+                    df_for_agg[partition_key_cols + [time_col, target_col]],
+                    partition_key_cols + [time_col],
                     {target_col: "sum"},
                     maintain_order=True,
                 )
                 partition_df = ufp.sort(
-                    partition_df, by=partition_cols_list + [time_col]
+                    partition_df, by=partition_key_cols + [time_col]
                 )
                 partition_df, partitions = _add_group_id(
-                    partition_df, partition_cols_list
+                    partition_df, partition_key_cols
                 )
                 partition_df = ufp.drop_index_if_pandas(partition_df)
                 partitions = ufp.drop_index_if_pandas(partitions)
@@ -583,6 +580,7 @@ class TimeSeries:
                     "ga": agg_ga,
                     "df": partition_df,
                     "partition_cols": partition_cols_list,
+                    "partition_key_cols": partition_key_cols,
                     "partitions": partitions,
                     "partition_uids": processed.uids,
                     "static_cols": static_cols,
@@ -719,26 +717,26 @@ class TimeSeries:
                 partition_df = state["df"]
                 ga = state["ga"]
                 partition_vals = ga.apply_transforms(transforms=tfms, updates_only=False)
-                partition_cols_list = state["partition_cols"]
+                partition_key_cols = state["partition_key_cols"]
                 feature_cols = list(partition_vals.keys())
                 if isinstance(df, pd.DataFrame):
-                    join_df = partition_df[partition_cols_list + [self.time_col]].copy()
+                    join_df = partition_df[partition_key_cols + [self.time_col]].copy()
                     for name, vals in partition_vals.items():
                         join_df[name] = vals
-                    joined = df[partition_cols_list + [self.time_col]].merge(
+                    joined = df[partition_key_cols + [self.time_col]].merge(
                         join_df,
-                        on=partition_cols_list + [self.time_col],
+                        on=partition_key_cols + [self.time_col],
                         how="left",
                     )
                     for name in feature_cols:
                         features[name] = joined[name].to_numpy()
                 else:
-                    join_df = partition_df.select(partition_cols_list + [self.time_col])
+                    join_df = partition_df.select(partition_key_cols + [self.time_col])
                     for name, vals in partition_vals.items():
                         join_df = join_df.with_columns(pl.Series(name=name, values=vals))
-                    joined = df.select(partition_cols_list + [self.time_col]).join(
+                    joined = df.select(partition_key_cols + [self.time_col]).join(
                         join_df,
-                        on=partition_cols_list + [self.time_col],
+                        on=partition_key_cols + [self.time_col],
                         how="left",
                     )
                     for name in feature_cols:
@@ -1096,6 +1094,7 @@ class TimeSeries:
                 state = self._partition_states[partition_cols]
                 updates = state["ga"].apply_transforms(transforms=tfms, updates_only=True)
                 partition_cols_list = state["partition_cols"]
+                partition_key_cols = state["partition_key_cols"]
                 dynamic_cols = state["dynamic_cols"]
                 if dynamic_cols:
                     if new_x is None:
@@ -1109,9 +1108,9 @@ class TimeSeries:
                             f"{missing}."
                         )
                 if isinstance(self.static_features_, pd.DataFrame):
-                    partition_keys = pd.DataFrame(index=np.arange(len(self.uids)))
+                    partition_keys = pd.DataFrame({self.id_col: self.uids})
                 else:
-                    partition_keys = pl_DataFrame()
+                    partition_keys = pl_DataFrame({self.id_col: self.uids})
                 for col in partition_cols_list:
                     if col in state["static_cols"]:
                         values = self.static_features_[col].to_numpy()
@@ -1127,12 +1126,12 @@ class TimeSeries:
                 partitions = state["partitions"]
                 if isinstance(partition_keys, pd.DataFrame):
                     mapped = partition_keys.merge(
-                        partitions, on=partition_cols_list, how="left"
+                        partitions, on=partition_key_cols, how="left"
                     )
                     missing_mask = mapped["_group_id"].isna()
                     if missing_mask.any():
                         unseen = (
-                            mapped.loc[missing_mask, partition_cols_list]
+                            mapped.loc[missing_mask, partition_key_cols]
                             .drop_duplicates()
                             .to_dict("records")
                         )
@@ -1143,13 +1142,13 @@ class TimeSeries:
                     partition_idx = mapped["_group_id"].to_numpy(dtype=np.int64)
                 else:
                     mapped = partition_keys.join(
-                        partitions, on=partition_cols_list, how="left"
+                        partitions, on=partition_key_cols, how="left"
                     )
                     missing_mask = mapped["_group_id"].is_null()
                     if missing_mask.any():
                         unseen = (
                             mapped.filter(missing_mask)
-                            .select(partition_cols_list)
+                            .select(partition_key_cols)
                             .unique(maintain_order=True)
                             .to_dicts()
                         )
@@ -1435,13 +1434,9 @@ class TimeSeries:
         X_df: Optional[DFType] = None,
         ids: Optional[List[str]] = None,
     ) -> DFType:
-        if ids is not None and (
-            self._get_global_tfms()
-            or self._get_group_tfms()
-            or self._get_partition_tfms()
-        ):
+        if ids is not None and (self._get_global_tfms() or self._get_group_tfms()):
             raise ValueError(
-                "Cannot use `ids` with global, group or partition lag transforms. "
+                "Cannot use `ids` with global or group lag transforms. "
                 "These transforms require forecasting all series together."
             )
         self._check_aligned_ends()
@@ -1654,7 +1649,7 @@ class TimeSeries:
         values = df[self.target_col].to_numpy()
         values = values.astype(self.ga.data.dtype, copy=False)
         self._check_aligned_ends()
-        if self._get_global_tfms() or self._get_group_tfms() or self._get_partition_tfms():
+        if self._get_global_tfms() or self._get_group_tfms():
             if isinstance(df, pd.DataFrame):
                 expected_ids = pd.Index(uids).union(pd.Index(new_ids))
                 expected_count = len(expected_ids)
@@ -1679,17 +1674,25 @@ class TimeSeries:
         if validate_input:   
             self._validate_new_df(df=df) 
         id_counts = ufp.counts_by_id(df, self.id_col)
+        uids_for_ops = uids
+        if isinstance(df, pl_DataFrame):
+            if isinstance(uids_for_ops, pd.Series):
+                uids_for_ops = pl.Series(uids_for_ops)
+            uids_for_ops = uids_for_ops.cast(pl.Utf8)
+            id_counts = id_counts.with_columns(pl.col(self.id_col).cast(pl.Utf8))
         try:
-            sizes = ufp.join(uids, id_counts, on=self.id_col, how="outer_coalesce")
+            sizes = ufp.join(uids_for_ops, id_counts, on=self.id_col, how="outer_coalesce")
         except (KeyError, ValueError):
             # pandas raises key error, polars before coalesce raises value error
-            sizes = ufp.join(uids, id_counts, on=self.id_col, how="outer")
+            sizes = ufp.join(uids_for_ops, id_counts, on=self.id_col, how="outer")
         sizes = ufp.fill_null(sizes, {"counts": 0})
         sizes = ufp.sort(sizes, by=self.id_col)
-        new_groups = ~ufp.is_in(sizes[self.id_col], uids)
+        new_groups = ~ufp.is_in(sizes[self.id_col], uids_for_ops)
         last_dates = ufp.group_by_agg(df, self.id_col, {self.time_col: "max"})
+        if isinstance(df, pl_DataFrame):
+            last_dates = last_dates.with_columns(pl.col(self.id_col).cast(pl.Utf8))
         last_dates = ufp.join(sizes, last_dates, on=self.id_col, how="left")
-        curr_last_dates = type(df)({self.id_col: uids, "_curr": self.last_dates})
+        curr_last_dates = type(df)({self.id_col: uids_for_ops, "_curr": self.last_dates})
         last_dates = ufp.join(last_dates, curr_last_dates, on=self.id_col, how="left")
         last_dates = ufp.fill_null(last_dates, {self.time_col: last_dates["_curr"]})
         last_dates = ufp.sort(last_dates, by=self.id_col)
@@ -1698,11 +1701,21 @@ class TimeSeries:
         if isinstance(df, pd.DataFrame):
             self.uids = pd.Index(self.uids)
             self.last_dates = pd.Index(self.last_dates)
+        elif isinstance(uids, pl.Series):
+            if not new_groups.any():
+                # Preserve original categorical ids when there are no new series.
+                self.uids = uids
+            elif uids.dtype == pl.Categorical:
+                self.uids = self.uids.cast(pl.Categorical)
         if new_groups.any():
             if self.target_transforms is not None:
                 raise ValueError("Can not update target_transforms with new series.")
             new_ids = ufp.filter_with_mask(sizes[self.id_col], new_groups)
-            new_ids_df = ufp.filter_with_mask(df, ufp.is_in(df[self.id_col], new_ids))
+            if isinstance(df, pl_DataFrame):
+                mask = ufp.is_in(ufp.cast(df[self.id_col], pl.Utf8), new_ids)
+                new_ids_df = ufp.filter_with_mask(df, mask)
+            else:
+                new_ids_df = ufp.filter_with_mask(df, ufp.is_in(df[self.id_col], new_ids))
             new_ids_counts = ufp.counts_by_id(new_ids_df, self.id_col)
             new_statics = ufp.take_rows(
                 df, new_ids_counts["counts"].to_numpy().cumsum() - 1
@@ -1855,25 +1868,25 @@ class TimeSeries:
 
             for partition_cols in partition_tfms.keys():
                 state = self._partition_states[partition_cols]
-                partition_cols_list = state["partition_cols"]
+                partition_key_cols = state["partition_key_cols"]
                 partition_df = ufp.group_by_agg(
-                    df[partition_cols_list + [self.time_col, self.target_col]],
-                    partition_cols_list + [self.time_col],
+                    df[partition_key_cols + [self.time_col, self.target_col]],
+                    partition_key_cols + [self.time_col],
                     {self.target_col: "sum"},
                     maintain_order=True,
                 )
                 partition_df = ufp.sort(
-                    partition_df, by=partition_cols_list + [self.time_col]
+                    partition_df, by=partition_key_cols + [self.time_col]
                 )
                 partitions = state["partitions"]
                 partition_df = _attach_partition_id(
-                    partition_df, partitions, partition_cols_list
+                    partition_df, partitions, partition_key_cols
                 )
                 if isinstance(partition_df, pd.DataFrame):
                     missing = partition_df["_group_id"].isna()
                     if missing.any():
                         new_partitions = (
-                            partition_df.loc[missing, partition_cols_list]
+                            partition_df.loc[missing, partition_key_cols]
                             .drop_duplicates()
                             .reset_index(drop=True)
                         )
@@ -1885,14 +1898,14 @@ class TimeSeries:
                             [partitions, new_partitions], ignore_index=True
                         )
                         partition_df = partition_df.drop(columns="_group_id").merge(
-                            partitions, on=partition_cols_list, how="left"
+                            partitions, on=partition_key_cols, how="left"
                         )
                 else:
                     missing = partition_df["_group_id"].is_null()
                     if missing.any():
                         new_partitions = (
                             partition_df.filter(missing)
-                            .select(partition_cols_list)
+                            .select(partition_key_cols)
                             .unique(maintain_order=True)
                         )
                         start = partitions.height
@@ -1903,7 +1916,7 @@ class TimeSeries:
                             [partitions, new_partitions], how="vertical"
                         )
                         partition_df = partition_df.drop("_group_id").join(
-                            partitions, on=partition_cols_list, how="left"
+                            partitions, on=partition_key_cols, how="left"
                         )
                 state["partitions"] = partitions
                 id_counts = ufp.counts_by_id(partition_df, "_group_id")
